@@ -77,6 +77,20 @@ InteractiveParser
 .. autoclass:: lark.parsers.lalr_interactive_parser.ImmutableInteractiveParser
     :members: choices, feed_token, copy, pretty, resume_parse, exhaust_lexer, accepts, as_mutable
 
+RepairSuggester
+---------------
+
+.. autoclass:: lark.parsers.lalr_suggester.RepairSuggester
+    :members: suggest
+
+.. autoclass:: lark.parsers.lalr_suggester.SuggestionResult
+
+.. autoclass:: lark.parsers.lalr_suggester.Suggestion
+    :members: apply
+
+.. autoclass:: lark.parsers.lalr_suggester.Edit
+    :members: replacement
+
 
 ast_utils
 ---------
