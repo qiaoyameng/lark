@@ -10,6 +10,35 @@ from .lalr_parser_state import ParserState
 
 ###{standalone
 
+class CompletionCandidate:
+    """The result of analyzing a single accepted token for completability.
+
+    Attributes:
+        token_type: The name of the accepted token type.
+        suffix: A finite sequence of token types that, when fed after ``token_type``
+            (followed by EOF), leads to a complete parse. ``None`` when no such
+            suffix could be found within the search limits.
+        completable: True iff ``suffix`` is not None.
+    """
+    __slots__ = 'token_type', 'suffix', 'completable'
+
+    def __init__(self, token_type, suffix):
+        self.token_type = token_type
+        self.suffix = suffix
+        self.completable = suffix is not None
+
+    def __repr__(self):
+        return '%s(%r, suffix=%r)' % (type(self).__name__, self.token_type, self.suffix)
+
+    def __eq__(self, other):
+        if not isinstance(other, CompletionCandidate):
+            return NotImplemented
+        return self.token_type == other.token_type and self.suffix == other.suffix
+
+    def __hash__(self):
+        return hash((self.token_type, self.suffix))
+
+
 class InteractiveParser:
     """InteractiveParser gives you advanced control over parsing and error handling when parsing with LALR.
 
@@ -116,6 +145,88 @@ class InteractiveParser:
                 else:
                     accepts.add(t)
         return accepts
+
+    def completion_analysis(self, max_steps=1000) -> List[CompletionCandidate]:
+        """Analyze whether each token in ``accepts()`` can lead to a complete parse.
+
+        For every accepted token, search (using only the grammar and the current
+        parser state, without invoking any user callbacks) for a finite suffix of
+        token types that completes the parse.
+
+        Returns a list of ``CompletionCandidate``, one per accepted token.
+        Candidates for which no completion could be proven (e.g. dead branches
+        that can be shifted but never finished, or completions that exceed
+        ``max_steps``) are marked with ``completable == False`` and a ``suffix``
+        of ``None``.
+
+        The search is breadth-first and bounded by ``max_steps`` state
+        expansions, so recursion, nullable cycles and empty productions cannot
+        make it loop forever.
+        """
+        return [
+            CompletionCandidate(t, self._find_completion_suffix(t, max_steps))
+            for t in sorted(self.accepts())
+        ]
+
+    def _find_completion_suffix(self, token_type, max_steps):
+        """Breadth-first search for a finite suffix of token types that, when fed
+        after ``token_type`` (followed by EOF), results in a complete parse.
+
+        Returns a tuple of token types (possibly empty), or None if no completion
+        was found within ``max_steps`` state expansions.
+        """
+        conf_no_callbacks = copy(self.parser_state.parse_conf)
+        # We don't want to call callbacks here since those might have arbitrary
+        # side effects and are unnecessarily slow.
+        conf_no_callbacks.callbacks = {}
+        make_token = self.lexer_thread._Token
+        states = conf_no_callbacks.states
+
+        def trial_state(state):
+            s = state.copy(deepcopy_values=False)
+            s.parse_conf = conf_no_callbacks
+            return s
+
+        start = trial_state(self.parser_state)
+        try:
+            start.feed_token(make_token(token_type, ''), token_type == '$END')
+        except UnexpectedToken:
+            return None
+        if token_type == '$END':
+            return ()
+
+        # The LALR automaton is fully determined by its state stack (the value
+        # stack only feeds callbacks, which are disabled), so visited stacks
+        # never need to be expanded again. Recursive grammars can still produce
+        # unboundedly many distinct stacks, hence the max_steps bound.
+        visited = {tuple(start.state_stack)}
+        queue = [(start, ())]
+        steps = 0
+        while queue and steps < max_steps:
+            state, suffix = queue.pop(0)
+            steps += 1
+
+            eof_state = trial_state(state)
+            try:
+                eof_state.feed_token(make_token('$END', ''), True)
+            except UnexpectedToken:
+                pass
+            else:
+                return suffix
+
+            for t in states[state.position]:
+                if not t.isupper() or t == '$END':  # not a feedable terminal
+                    continue
+                next_state = trial_state(state)
+                try:
+                    next_state.feed_token(make_token(t, ''))
+                except UnexpectedToken:
+                    continue
+                key = tuple(next_state.state_stack)
+                if key not in visited:
+                    visited.add(key)
+                    queue.append((next_state, suffix + (t,)))
+        return None
 
     def resume_parse(self):
         """Resume automated parsing from the current state.

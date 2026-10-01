@@ -2764,6 +2764,121 @@ def _make_parser_test(LEXER, PARSER):
             res = ip.feed_eof()
             self.assertEqual(res.children, [1, 2, 1])
 
+        @unittest.skipIf(PARSER != 'lalr', "interactive_parser is only implemented for LALR at the moment")
+        def test_interactive_completion_analysis(self):
+            # Grammar with a dead branch: D can be shifted, but `loop` has no
+            # base case, so no finite suffix can ever complete the parse.
+            grammar = r"""
+                start: A rest
+                rest: B C
+                    | D loop
+                loop: E loop
+
+                A: "a"
+                B: "b"
+                C: "c"
+                D: "d"
+                E: "e"
+            """
+            parser = _Lark(grammar)
+            ip = parser.parse_interactive()
+            ip.feed_token(Token('A', 'a'))
+
+            # Both B and D pass a one-step shift...
+            self.assertEqual(ip.accepts(), {'B', 'D'})
+
+            candidates = {c.token_type: c for c in ip.completion_analysis(max_steps=100)}
+            self.assertEqual(set(candidates), {'B', 'D'})
+
+            # ...but only B can be completed. D is a dead branch.
+            self.assertTrue(candidates['B'].completable)
+            self.assertEqual(candidates['B'].suffix, ('C',))
+            self.assertFalse(candidates['D'].completable)
+            self.assertIsNone(candidates['D'].suffix)
+
+            # Replay each completable candidate token-by-token, proving the
+            # suffix really leads to a complete parse (not just one shift).
+            for cand in candidates.values():
+                if not cand.completable:
+                    continue
+                cursor = ip.copy()
+                cursor.feed_token(Token(cand.token_type, cand.token_type.lower()))
+                for token_type in cand.suffix:
+                    cursor.feed_token(Token(token_type, token_type.lower()))
+                tree = cursor.feed_eof()
+                self.assertEqual(tree, Tree('start', [Token('A', 'a'), Tree('rest', ['b', 'c'])]))
+
+            # The analysis must not disturb the parser state it ran on.
+            self.assertEqual(ip.accepts(), {'B', 'D'})
+
+        @unittest.skipIf(PARSER != 'lalr', "interactive_parser is only implemented for LALR at the moment")
+        def test_interactive_completion_analysis_nullable_and_recursive(self):
+            # Nullable cycle (`maybe` can derive empty), left recursion and an
+            # empty production: the analysis must terminate and stay correct.
+            grammar = r"""
+                start: A maybe B
+                maybe: maybe C |
+
+                A: "a"
+                B: "b"
+                C: "c"
+            """
+            parser = _Lark(grammar)
+            ip = parser.parse_interactive()
+            ip.feed_token(Token('A', 'a'))
+
+            self.assertEqual(ip.accepts(), {'B', 'C'})
+            candidates = {c.token_type: c for c in ip.completion_analysis()}
+            self.assertEqual(set(candidates), {'B', 'C'})
+            self.assertTrue(all(c.completable for c in candidates.values()))
+
+            for cand in candidates.values():
+                cursor = ip.copy()
+                cursor.feed_token(Token(cand.token_type, ''))
+                for token_type in cand.suffix:
+                    cursor.feed_token(Token(token_type, ''))
+                tree = cursor.feed_eof()
+                self.assertEqual(tree.data, 'start')
+
+        @unittest.skipIf(PARSER != 'lalr', "interactive_parser is only implemented for LALR at the moment")
+        def test_interactive_completion_analysis_no_callbacks(self):
+            grammar = r"""
+                start: SYM+
+
+                SYM: "a" | "b"
+            """
+
+            class SYMTransformer(lark.visitors.Transformer):
+                calls = 0
+
+                def SYM(self, token):
+                    type(self).calls += 1
+                    return token
+
+            parser = _Lark(grammar, transformer=SYMTransformer())
+            ip = parser.parse_interactive()
+            ip.feed_token(Token('SYM', 'a'))
+
+            calls_before = SYMTransformer.calls
+            candidates = {c.token_type: c for c in ip.completion_analysis()}
+            self.assertEqual(set(candidates), {'$END', 'SYM'})
+            self.assertTrue(all(c.completable for c in candidates.values()))
+            # The analysis is grammar/state only; user callbacks are never run.
+            self.assertEqual(SYMTransformer.calls, calls_before)
+
+            # Replay every candidate: feed it, feed its suffix, then EOF.
+            for cand in candidates.values():
+                cursor = ip.copy()
+                if cand.token_type == '$END':
+                    self.assertEqual(cand.suffix, ())
+                    tree = cursor.feed_eof()
+                else:
+                    cursor.feed_token(Token(cand.token_type, 'a'))
+                    for token_type in cand.suffix:
+                        cursor.feed_token(Token(token_type, 'a'))
+                    tree = cursor.feed_eof()
+                self.assertEqual(tree.data, 'start')
+
         @unittest.skipIf(PARSER == 'earley', "Tree-less mode is not supported in earley")
         def test_default_in_treeless_mode(self):
             grammar = r"""

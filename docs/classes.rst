@@ -72,10 +72,13 @@ InteractiveParser
 -----------------
 
 .. autoclass:: lark.parsers.lalr_interactive_parser.InteractiveParser
-    :members: choices, feed_token, copy, pretty, resume_parse, exhaust_lexer, accepts, as_immutable
+    :members: choices, feed_token, copy, pretty, resume_parse, exhaust_lexer, accepts, completion_analysis, as_immutable
 
 .. autoclass:: lark.parsers.lalr_interactive_parser.ImmutableInteractiveParser
-    :members: choices, feed_token, copy, pretty, resume_parse, exhaust_lexer, accepts, as_mutable
+    :members: choices, feed_token, copy, pretty, resume_parse, exhaust_lexer, accepts, completion_analysis, as_mutable
+
+.. autoclass:: lark.parsers.lalr_interactive_parser.CompletionCandidate
+    :members: token_type, suffix, completable
 
 
 ast_utils
