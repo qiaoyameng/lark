@@ -6,8 +6,8 @@ For now, shift/reduce conflicts are automatically resolved as shifts.
 # Author: Erez Shinan (2017)
 # Email : erezshin@gmail.com
 
-from typing import Dict, Set, Iterator, Tuple, List, TypeVar, Generic
-from collections import defaultdict
+from typing import Dict, Optional, Sequence, Set, Iterator, Tuple, List, TypeVar, Generic
+from collections import defaultdict, deque
 
 from ..utils import classify, classify_bool, bfs, fzset, Enumerator, logger
 from ..exceptions import GrammarError
@@ -95,6 +95,173 @@ class IntParseTable(ParseTableBase[int]):
         return cls(int_states, start_states, end_states)
 
 ###}
+
+
+# Bounds for the conflict-witness search (strict mode). The search is best
+# effort: if any bound is exceeded, we give up and report the plain conflict.
+_WITNESS_MAX_PATH_SYMBOLS = 64    # max symbols on the path to the conflict state
+_WITNESS_MAX_DERIVATION_LEN = 16  # max terminals when expanding a single symbol
+_WITNESS_MAX_PREFIX_TOKENS = 32   # max terminals in the reported prefix
+_WITNESS_MAX_REPLAY_CONFIGS = 4096  # max parser configurations explored in replay
+
+
+def _shortest_terminal_derivations(rules: Sequence[Rule], max_len: int) -> Dict[Symbol, Tuple[Symbol, ...]]:
+    """Compute, for every symbol, a shortest derivation into a sequence of terminals.
+
+    Symbols that cannot derive a terminal string of at most ``max_len``
+    terminals are absent from the result.
+    """
+    derivations: Dict[Symbol, Tuple[Symbol, ...]] = {}
+    for rule in rules:
+        for sym in rule.expansion:
+            if sym.is_term and sym not in derivations:
+                derivations[sym] = (sym,)
+
+    changed = True
+    while changed:
+        changed = False
+        for rule in rules:
+            tokens: List[Symbol] = []
+            for sym in rule.expansion:
+                d = derivations.get(sym)
+                if d is None or len(tokens) + len(d) > max_len:
+                    break
+                tokens += d
+            else:
+                current = derivations.get(rule.origin)
+                if current is None or len(tokens) < len(current):
+                    derivations[rule.origin] = tuple(tokens)
+                    changed = True
+    return derivations
+
+
+def _find_symbol_path(start_state: LR0ItemSet, target_state: LR0ItemSet, max_depth: int) -> Optional[Tuple[Symbol, ...]]:
+    """BFS for a shortest path of grammar symbols from start_state to target_state."""
+    parents: Dict[LR0ItemSet, Optional[Tuple[LR0ItemSet, Symbol]]] = {start_state: None}
+    queue = deque([(start_state, 0)])
+    while queue:
+        state, depth = queue.popleft()
+        if state is target_state:
+            path = []
+            node = state
+            while parents[node] is not None:
+                prev, sym = parents[node]  # type: ignore[misc]
+                path.append(sym)
+                node = prev
+            return tuple(reversed(path))
+        if depth >= max_depth:
+            continue
+        for sym, next_state in state.transitions.items():
+            if next_state not in parents:
+                parents[next_state] = (state, sym)
+                queue.append((next_state, depth + 1))
+    return None
+
+
+def replay_token_prefix(start_state: LR0ItemSet, prefix: Sequence[Symbol],
+                        conflict_state: LR0ItemSet, lookahead: Symbol,
+                        max_configs: int = _WITNESS_MAX_REPLAY_CONFIGS) -> bool:
+    """Replay a token prefix through the LR automaton, non-deterministically.
+
+    Returns True iff some run consumes exactly ``prefix`` and ends in
+    ``conflict_state`` with ``lookahead`` as the next token, where both a
+    shift and a reduce action are available for it. Explores at most
+    ``max_configs`` parser configurations.
+    """
+    end = len(prefix)
+    init = ((start_state,), 0)
+    queue = deque([init])
+    seen = {init}
+    while queue:
+        if len(seen) > max_configs:
+            return False
+        stack, pos = queue.popleft()
+        state = stack[-1]
+        token = prefix[pos] if pos < end else lookahead
+        if pos == end and state is conflict_state \
+                and lookahead in state.transitions and state.lookaheads.get(lookahead):
+            return True
+        # Reduce options (also available once the prefix is fully consumed)
+        for rule in state.lookaheads.get(token, ()):
+            n = len(rule.expansion)
+            if n < len(stack):
+                base = stack[:-n] if n else stack
+                goto = base[-1].transitions.get(rule.origin)
+                if goto is not None:
+                    config = (base + (goto,), pos)
+                    if config not in seen:
+                        seen.add(config)
+                        queue.append(config)
+        # Shift option (never shift the lookahead: the conflict must follow the prefix)
+        if pos < end:
+            next_state = state.transitions.get(token)
+            if next_state is not None:
+                config = (stack + (next_state,), pos + 1)
+                if config not in seen:
+                    seen.add(config)
+                    queue.append(config)
+    return False
+
+
+class ShiftReduceConflictWitness:
+    """A token-level witness for a shift/reduce conflict.
+
+    ``prefix`` is a sequence of terminals that drives the LR automaton into
+    the conflicted state, and ``lookahead`` is the terminal that triggers the
+    conflict there. These are terminal *names*; no claim is made that they
+    form literal parseable source text.
+    """
+    def __init__(self, prefix: Tuple[Symbol, ...], lookahead: Symbol,
+                 shift_items: Tuple[RulePtr, ...], reduce_rule: Rule):
+        self.prefix = prefix
+        self.lookahead = lookahead
+        self.shift_items = shift_items
+        self.reduce_rule = reduce_rule
+
+    def __str__(self) -> str:
+        prefix_str = ' '.join(t.name for t in self.prefix) or '(empty)'
+        lines = [
+            ' * Reduce: %s' % self.reduce_rule,
+        ]
+        lines += [' * Shift: %s' % rp for rp in self.shift_items]
+        lines += [
+            ' * Witness: token prefix [%s] reaches the conflict state,'
+            ' where lookahead %s triggers the conflict' % (prefix_str, self.lookahead.name),
+            '   (token-level witness: terminal names only, not literal source text)',
+        ]
+        return '\n'.join(lines) + '\n'
+
+
+def compute_shift_reduce_witness(analyzer: 'LALR_Analyzer', conflict_state: LR0ItemSet,
+                                 lookahead: Symbol, reduce_rule: Rule) -> Optional[ShiftReduceConflictWitness]:
+    """Try to build a replay-verified, token-level witness for a shift/reduce conflict.
+
+    Returns None when the bounded search cannot produce or verify a witness;
+    callers should then fall back to the plain conflict message.
+    """
+    shift_items = tuple(rp for rp in conflict_state.closure
+                        if not rp.is_satisfied and rp.next == lookahead)
+    if not shift_items:
+        return None
+
+    rules = [r for rs in analyzer.lr0_rules_by_origin.values() for r in rs]
+    derivations = _shortest_terminal_derivations(rules, _WITNESS_MAX_DERIVATION_LEN)
+
+    for start_state in analyzer.lr0_start_states.values():
+        path = _find_symbol_path(start_state, conflict_state, _WITNESS_MAX_PATH_SYMBOLS)
+        if path is None:
+            continue
+        prefix: List[Symbol] = []
+        for sym in path:
+            d = derivations.get(sym)
+            if d is None or len(prefix) + len(d) > _WITNESS_MAX_PREFIX_TOKENS:
+                break
+            prefix += d
+        else:
+            prefix_t = tuple(prefix)
+            if replay_token_prefix(start_state, prefix_t, conflict_state, lookahead):
+                return ShiftReduceConflictWitness(prefix_t, lookahead, shift_items, reduce_rule)
+    return None
 
 
 # digraph and traverse, see The Theory and Practice of Compiler Writing
@@ -285,8 +452,12 @@ class LALR_Analyzer(GrammarAnalyzer):
                 rule ,= rules
                 if la in actions:
                     if self.strict:
-                        msg = f'Shift/Reduce conflict for terminal {la.name}. [strict-mode]\n' \
-                              f' * {rule}\n'
+                        msg = f'Shift/Reduce conflict for terminal {la.name}. [strict-mode]\n'
+                        witness = compute_shift_reduce_witness(self, itemset, la, rule)
+                        if witness is not None:
+                            msg += str(witness)
+                        else:
+                            msg += f' * {rule}\n'
                         raise GrammarError(msg)
                     elif self.debug:
                         logger.warning('Shift/Reduce conflict for terminal %s: (resolving as shift)', la.name)

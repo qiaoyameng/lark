@@ -26,6 +26,8 @@ except ImportError:
 
 from .test_logger import Testlogger
 
+from .test_lalr_witness import TestLALRConflictWitness
+
 from .test_parser import *  # We define __all__ to list which TestSuites to run
 
 if sys.version_info >= (3, 10):
