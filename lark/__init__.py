@@ -8,6 +8,7 @@ from .exceptions import (
     UnexpectedInput,
     UnexpectedToken,
 )
+from .edit_session import EditSession
 from .lark import Lark
 from .lexer import Token
 from .parser_frontends import ScanMatch
@@ -27,6 +28,7 @@ __all__ = (
     "UnexpectedInput",
     "UnexpectedToken",
     "Lark",
+    "EditSession",
     "Token",
     "ScanMatch",
     "ParseTree",

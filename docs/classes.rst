@@ -5,7 +5,7 @@ Lark
 ----
 
 .. autoclass:: lark.Lark
-    :members: open, parse, parse_interactive, scan, lex, save, load, get_terminal, open_from_package
+    :members: open, parse, parse_interactive, scan, edit_session, lex, save, load, get_terminal, open_from_package
 
 
 Using Unicode character classes with ``regex``
@@ -109,3 +109,11 @@ ScanMatch
 A single match yielded by :meth:`Lark.scan`.
 
 .. autoclass:: lark.ScanMatch
+
+EditSession
+-----------
+
+An incremental parsing session returned by :meth:`Lark.edit_session`.
+
+.. autoclass:: lark.EditSession
+    :members: edit, text, result

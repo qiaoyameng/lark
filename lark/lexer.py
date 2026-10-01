@@ -341,6 +341,15 @@ class LineCounter:
         self.char_pos = pos
         self.column = self.char_pos - self.line_start_pos + 1
 
+    def __copy__(self):
+        inst = type(self).__new__(type(self))
+        inst.newline_char = self.newline_char
+        inst.char_pos = self.char_pos
+        inst.line = self.line
+        inst.column = self.column
+        inst.line_start_pos = self.line_start_pos
+        return inst
+
 
 class UnlessCallback:
     def __init__(self, scanner: 'Scanner'):

@@ -26,6 +26,7 @@ from .lexer import Lexer, BasicLexer, TerminalDef, LexerThread, Token
 from .visitors import _Return_T
 from .parse_tree_builder import ParseTreeBuilder
 from .parser_frontends import _validate_frontend_args, _get_lexer_callbacks, _deserialize_parsing_frontend, _construct_parsing_frontend
+from .edit_session import EditSession
 from .grammar import Rule
 
 
@@ -778,6 +779,34 @@ class Lark(Serialize, Generic[_Return_T]):
         if self.options.parser != 'lalr':
             raise ConfigurationError("scan() requires parser='lalr'")
         return self.parser.scan(text, start=start)
+
+    def edit_session(self, text: Union[str, bytes], start: Optional[str]=None) -> 'EditSession':
+        """Start an incremental parsing session over ``text``. Only works when parser='lalr'.
+
+        The session parses ``text`` eagerly, and then applies edits via
+        ``EditSession.edit(start, end, replacement)``, which replaces a range
+        of the text and returns the updated parse result. Only the unchanged
+        prefix is reused: parsing resumes from the last safe checkpoint before
+        the edit, restoring the full lexer state (including the contextual
+        lexer's candidate terminals), while everything at and after the edit
+        is re-lexed and re-parsed. Lexer and transformer callbacks don't fire
+        again for the retained prefix.
+
+        Requires lexer='basic' or lexer='contextual' (the default), and no
+        ``postlex``.
+
+        Parameters:
+            text (str | bytes): The initial text to parse.
+            start (str, optional): Start symbol. Required if Lark was initialized with multiple start symbols.
+
+        Returns:
+            An ``EditSession`` instance.
+
+        See Also: ``Lark.parse()``
+        """
+        if self.options.parser != 'lalr':
+            raise ConfigurationError("edit_session() requires parser='lalr'")
+        return EditSession(self.parser, text, start=start)
 
 
 ###}

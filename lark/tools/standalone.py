@@ -67,6 +67,7 @@ EXTRACT_STANDALONE_FILES = [
     'parsers/lalr_parser_state.py',
     'parsers/lalr_parser.py',
     'parsers/lalr_interactive_parser.py',
+    'edit_session.py',
     'parser_frontends.py',
     'lark.py',
     'indenter.py',
