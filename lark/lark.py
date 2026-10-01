@@ -698,6 +698,18 @@ class Lark(Serialize, Generic[_Return_T]):
         """Get information about a terminal"""
         return self._terminals_dict[name]
 
+    def edit_session(self, text: LarkInput, start: Optional[str]=None) -> 'EditSession':
+        """Start an incremental editing session. Only works when parser='lalr' with
+        the built-in 'basic' or 'contextual' lexer (no postlex or custom lexer).
+
+        The session parses ``text`` once and then incrementally applies edits
+        (insertions, deletions and replacements), returning an updated tree
+        after each one. Results are identical to parsing the edited document
+        from scratch; see :class:`lark.parsers.edit_session.EditSession`.
+        """
+        from .parsers.edit_session import EditSession
+        return EditSession(self, text, start=start)
+
     def parse_interactive(self, text: Optional[LarkInput]=None, start: Optional[str]=None) -> 'InteractiveParser':
         """Start an interactive parsing session. Only works when parser='lalr'.
 
