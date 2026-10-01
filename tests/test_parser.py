@@ -2761,8 +2761,85 @@ def _make_parser_test(LEXER, PARSER):
             ip.exhaust_lexer()
             # Previously `accepts` would call `SYMTransformer.SYM` with `Token('SYM', '')`, which would cause an error.
             self.assertEqual(ip.accepts(), {"$END", "SYM"})
+            self.assertEqual(ip.completions(), {"$END": (), "SYM": ()})
+            self.assertEqual(ip.accepts(), {"$END", "SYM"})
             res = ip.feed_eof()
             self.assertEqual(res.children, [1, 2, 1])
+
+        @unittest.skipIf(
+            PARSER != 'lalr',
+            "interactive completion is only implemented for LALR at the moment")
+        def test_interactive_completions(self):
+            grammar = r"""
+                start: GOOD END | BAD dead
+                GOOD: "g"
+                END: "e"
+                BAD: "b"
+                dead: X dead
+                X: "x"
+            """
+            parser = _Lark(grammar)
+            ip = parser.parse_interactive("")
+
+            self.assertEqual(ip.accepts(), {"GOOD", "BAD"})
+            self.assertEqual(ip.completions(), {"GOOD": ("END",), "BAD": None})
+            self.assertIsNotNone(ip.parser_state.parse_conf.callbacks)
+
+            for first, suffix in ip.completions().items():
+                if suffix is None:
+                    continue
+
+                replay = parser.parse_interactive("")
+                replay.parser_state.parse_conf.callbacks = {}
+                first_token = replay.lexer_thread._Token(first, '')
+                replay.parser_state.feed_token(first_token)
+                for token in suffix:
+                    next_token = replay.lexer_thread._Token(token, '')
+                    replay.parser_state.feed_token(next_token)
+                end_token = replay.lexer_thread._Token('$END', '')
+                replay.parser_state.feed_token(end_token, True)
+
+        @unittest.skipIf(
+            PARSER != 'lalr',
+            "interactive completion is only implemented for LALR at the moment")
+        def test_interactive_completions_recursion_and_nullability(self):
+            parser = _Lark(r"""
+                start: LPAR recurse RPAR | X | nullable
+                recurse: LPAR recurse RPAR | X
+                LPAR: "("
+                RPAR: ")"
+                X: "x"
+                nullable: loop END | EMPTY_END
+                loop: loop LOOP |
+                LOOP: "l"
+                END: "e"
+                EMPTY_END: "z"
+            """)
+
+            completions = parser.parse_interactive("").completions()
+            self.assertEqual(completions["X"], ())
+            self.assertEqual(completions["LPAR"], ("X", "RPAR"))
+            self.assertEqual(completions["EMPTY_END"], ())
+            self.assertEqual(completions["LOOP"], ("END",))
+
+            for first, suffix in completions.items():
+                if suffix is None:
+                    continue
+
+                replay = parser.parse_interactive("")
+                replay.parser_state.parse_conf.callbacks = {}
+                if first == '$END':
+                    end_token = replay.lexer_thread._Token(first, '')
+                    replay.parser_state.feed_token(end_token, True)
+                    continue
+
+                first_token = replay.lexer_thread._Token(first, '')
+                replay.parser_state.feed_token(first_token)
+                for token in suffix:
+                    next_token = replay.lexer_thread._Token(token, '')
+                    replay.parser_state.feed_token(next_token)
+                end_token = replay.lexer_thread._Token('$END', '')
+                replay.parser_state.feed_token(end_token, True)
 
         @unittest.skipIf(PARSER == 'earley', "Tree-less mode is not supported in earley")
         def test_default_in_treeless_mode(self):

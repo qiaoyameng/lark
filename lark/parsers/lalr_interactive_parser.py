@@ -1,11 +1,12 @@
 # This module provides a LALR interactive parser, which is used for debugging and error handling
 
-from typing import Iterator, List
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 from copy import copy
 import warnings
 
 from lark.exceptions import UnexpectedToken
 from lark.lexer import Token, LexerThread
+from .lalr_analysis import Shift, StateT
 from .lalr_parser_state import ParserState
 
 ###{standalone
@@ -15,6 +16,11 @@ class InteractiveParser:
 
     For a simpler interface, see the ``on_error`` argument to ``Lark.parse()``.
     """
+
+    @staticmethod
+    def _is_shift(action) -> bool:
+        return action == 0 if isinstance(action, int) else action is Shift
+
     def __init__(self, parser, parser_state: ParserState, lexer_thread: LexerThread):
         self.parser = parser
         self.parser_state = parser_state
@@ -117,11 +123,132 @@ class InteractiveParser:
                     accepts.add(t)
         return accepts
 
+    def _advance_state_stack_without_callbacks(
+            self,
+            state_stack: Tuple[StateT, ...],
+            terminal: str,
+            is_end: bool=False
+    ) -> Optional[Tuple[StateT, ...]]:
+        states = self.parser_state.parse_conf.states
+        end_state = self.parser_state.parse_conf.end_state
+        next_stack = list(state_stack)
+        reductions: Set[Tuple[Tuple[StateT, ...], str]] = set()
+        empty_reductions: Set[Tuple[StateT, str]] = set()
+
+        while True:
+            state = next_stack[-1]
+            try:
+                action, arg = states[state][terminal]
+            except KeyError:
+                return None
+
+            if self._is_shift(action):
+                if is_end:
+                    return None
+                next_stack.append(arg)
+                return tuple(next_stack)
+
+            rule = arg
+            size = len(rule.expansion)
+            reduce_key = (tuple(next_stack), terminal)
+            if reduce_key in reductions:
+                return None
+            reductions.add(reduce_key)
+
+            if size == 0:
+                empty_key = (state, terminal)
+                if empty_key in empty_reductions:
+                    return None
+                empty_reductions.add(empty_key)
+            else:
+                empty_reductions.clear()
+
+            if len(next_stack) < size:
+                return None
+            if size:
+                del next_stack[-size:]
+
+            try:
+                goto_action, new_state = states[next_stack[-1]][rule.origin.name]
+            except KeyError:
+                return None
+            if not self._is_shift(goto_action):
+                return None
+
+            next_stack.append(new_state)
+            if is_end and next_stack[-1] == end_state:
+                return tuple(next_stack)
+
+    def completions(
+            self, max_completion_tokens: int=100
+    ) -> Dict[str, Optional[Tuple[str, ...]]]:
+        """Return a finite completion suffix for each currently accepted terminal.
+
+        The suffix does not include the synthetic ``$END`` terminal. A value of
+        ``None`` means that no completion could be proven within
+        ``max_completion_tokens`` terminals.
+
+        Only the parser table and state stack are used, so parser callbacks are
+        not called.
+        """
+        initial_stack = tuple(self.parser_state.state_stack)
+        completions: Dict[str, Optional[Tuple[str, ...]]] = {}
+        advance = self._advance_state_stack_without_callbacks
+
+        for token in self.accepts():
+            if token == '$END':
+                stack = advance(initial_stack, token, is_end=True)
+                completions[token] = () if stack is not None else None
+                continue
+            else:
+                stack = advance(initial_stack, token)
+
+            if stack is None:
+                completions[token] = None
+                continue
+
+            if advance(stack, '$END', is_end=True) is not None:
+                completions[token] = ()
+                continue
+
+            queue: List[Tuple[Tuple[StateT, ...], Tuple[str, ...]]] = [(stack, ())]
+            queue_head = 0
+            visited = {stack}
+            suffix: Optional[Tuple[str, ...]] = None
+
+            while queue_head < len(queue) and suffix is None:
+                current_stack, current_suffix = queue[queue_head]
+                queue_head += 1
+                if len(current_suffix) >= max_completion_tokens:
+                    continue
+
+                for next_token in self.parser_state.parse_conf.states[current_stack[-1]]:
+                    if next_token == '$END' or not next_token.isupper():
+                        continue
+
+                    next_stack = advance(current_stack, next_token)
+                    if next_stack is None:
+                        continue
+
+                    next_suffix = current_suffix + (next_token,)
+                    completed = advance(next_stack, '$END', is_end=True)
+                    if completed is not None:
+                        suffix = next_suffix
+                        break
+
+                    if (len(next_suffix) < max_completion_tokens
+                            and next_stack not in visited):
+                        visited.add(next_stack)
+                        queue.append((next_stack, next_suffix))
+
+            completions[token] = suffix
+
+        return completions
+
     def resume_parse(self):
         """Resume automated parsing from the current state.
         """
         return self.parser.parse_from_state(self.parser_state, last_token=self.lexer_thread.state.last_token)
-
 
 
 class ImmutableInteractiveParser(InteractiveParser):
