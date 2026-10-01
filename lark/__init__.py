@@ -8,6 +8,7 @@ from .exceptions import (
     UnexpectedInput,
     UnexpectedToken,
 )
+from .error_suggest import Edit, Suggestion, SuggestionResult, suggest_fixes
 from .lark import Lark
 from .lexer import Token
 from .parser_frontends import ScanMatch
@@ -26,6 +27,10 @@ __all__ = (
     "UnexpectedEOF",
     "UnexpectedInput",
     "UnexpectedToken",
+    "Edit",
+    "Suggestion",
+    "SuggestionResult",
+    "suggest_fixes",
     "Lark",
     "Token",
     "ScanMatch",
