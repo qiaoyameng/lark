@@ -133,6 +133,14 @@ p = Lark(collision_grammar, parser='lalr', strict=True)
 # lark.exceptions.GrammarError: Shift/Reduce conflict for terminal A. [strict-mode]
 ```
 
+To help locate the problem, strict-mode also attaches a token-level conflict
+witness to Shift/Reduce errors: a token prefix that leads the parser to the
+conflicting state, the lookahead on which Shift and Reduce compete, and the
+two competing items. The prefix is reported as token names (not source text);
+concrete example lexemes are only shown when every terminal involved is a
+plain string. The witness is also available programmatically as the
+`conflict_witness` attribute of the raised `GrammarError`.
+
 ## Tools
 
 ### Stand-alone parser

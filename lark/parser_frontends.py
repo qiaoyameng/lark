@@ -281,6 +281,8 @@ def create_lalr_parser(lexer_conf: LexerConf, parser_conf: ParserConf, options=N
     debug = options.debug if options else False
     strict = options.strict if options else False
     cls = (options and options._plugins.get('LALR_Parser')) or LALR_Parser
+    if cls is LALR_Parser:
+        return cls(parser_conf, debug=debug, strict=strict, lexer_conf=lexer_conf)
     return cls(parser_conf, debug=debug, strict=strict)
 
 _parser_creators['lalr'] = create_lalr_parser

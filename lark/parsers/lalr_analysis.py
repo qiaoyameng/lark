@@ -15,6 +15,7 @@ from ..exceptions import GrammarError
 from .grammar_analysis import GrammarAnalyzer, Terminal, LR0ItemSet, RulePtr, State
 from ..grammar import Rule, Symbol
 from ..common import ParserConf
+from .lalr_witness import build_shift_reduce_witness
 
 ###{standalone
 
@@ -154,8 +155,9 @@ class LALR_Analyzer(GrammarAnalyzer):
     directly_reads: Dict[Tuple[LR0ItemSet, Symbol], Set[Symbol]]
 
 
-    def __init__(self, parser_conf: ParserConf, debug: bool=False, strict: bool=False):
+    def __init__(self, parser_conf: ParserConf, debug: bool=False, strict: bool=False, lexer_conf=None):
         GrammarAnalyzer.__init__(self, parser_conf, debug, strict)
+        self.lexer_conf = lexer_conf
         self.nonterminal_transitions = []
         self.directly_reads = defaultdict(set)
         self.reads = defaultdict(set)
@@ -287,7 +289,14 @@ class LALR_Analyzer(GrammarAnalyzer):
                     if self.strict:
                         msg = f'Shift/Reduce conflict for terminal {la.name}. [strict-mode]\n' \
                               f' * {rule}\n'
-                        raise GrammarError(msg)
+                        terminals_by_name = (self.lexer_conf.terminals_by_name
+                                             if self.lexer_conf is not None else None)
+                        witness = build_shift_reduce_witness(self, itemset, la, rule, terminals_by_name)
+                        if witness is not None:
+                            msg += '\n' + witness.format()
+                        err = GrammarError(msg)
+                        err.conflict_witness = witness
+                        raise err
                     elif self.debug:
                         logger.warning('Shift/Reduce conflict for terminal %s: (resolving as shift)', la.name)
                         logger.warning(' * %s', rule)
