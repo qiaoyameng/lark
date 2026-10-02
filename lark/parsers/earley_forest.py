@@ -7,17 +7,79 @@ Full reference and more details is here:
 https://web.archive.org/web/20190616123959/http://www.bramvandersanden.com/post/2014/06/shared-packed-parse-forest/
 """
 
-from typing import Type, AbstractSet
+from typing import Type, AbstractSet, Callable
 from random import randint
 from collections import deque
 from operator import attrgetter
 from importlib import import_module
 from functools import partial
+from heapq import heappop, heappush
+
+from ..exceptions import GrammarError
 
 from ..parse_tree_builder import AmbiguousIntermediateExpander
 from ..visitors import Discard
 from ..utils import logger, OrderedSet
 from ..tree import Tree
+
+
+class ForestCycleError(GrammarError):
+    """Raised when a top-k derivation iterator encounters a cyclic SPPF.
+
+    Cyclic forests can represent infinitely many derivations. Use
+    ``on_cycle='skip'`` to enumerate only derivations that do not use packed
+    nodes participating in a cycle.
+    """
+
+
+class Derivation:
+    """One selected derivation of a :class:`SymbolNode`.
+
+    The derivation is represented as a shared DAG. The same shared child
+    derivation object is reused by parent derivations instead of being copied.
+
+    Attributes:
+        symbol_node: The SPPF symbol node derived.
+        packed_node: The packed node selected for this symbol node.
+        rule: The production applied by this packed node.
+        cost: Total non-negative cost of the derivation.
+        left: The binary SPPF left child (``None``, a :class:`TokenNode`, or
+            another ``Derivation``).
+        right: The binary SPPF right child.
+    """
+
+    __slots__ = ('symbol_node', 'packed_node', 'rule', 'cost', 'left', 'right')
+
+    def __init__(self, symbol_node, packed_node, rule, cost, left, right):
+        self.symbol_node = symbol_node
+        self.packed_node = packed_node
+        self.rule = rule
+        self.cost = cost
+        self.left = left
+        self.right = right
+
+    @property
+    def children(self):
+        """The logical production children, in left-to-right order.
+
+        Intermediate SPPF nodes used by the parser's binary representation are
+        flattened. Values are either :class:`TokenNode` instances or final
+        ``Derivation`` instances.
+        """
+        return _logical_children(self)
+
+    def to_tree(self, tree_class=Tree):
+        """Materialize this shared derivation as an ordinary parse tree.
+
+        Repeated occurrences of a shared subtree are copied in the resulting
+        tree, as required by a tree representation. This does not apply token
+        filtering, rule inlining, or parse-tree builder callbacks.
+        """
+        return _derivation_to_tree(self, tree_class)
+
+    def __repr__(self):
+        return '{}(cost={}, rule={!r})'.format(type(self).__name__, self.cost, self.rule)
+
 
 class ForestNode:
     pass
@@ -800,3 +862,420 @@ class ForestToPyDotVisitor(ForestVisitor):
             child_graph_node_id = str(id(child))
             child_graph_node = self.graph.get_node(child_graph_node_id)[0]
             self.graph.add_edge(self.pydot.Edge(graph_node, child_graph_node))
+
+
+def _logical_children(derivation):
+    result = []
+    stack = [derivation.right, derivation.left]
+    while stack:
+        value = stack.pop()
+        if value is None:
+            continue
+        if isinstance(value, TokenNode):
+            result.append(value)
+        elif value.symbol_node.is_intermediate:
+            stack.append(value.right)
+            stack.append(value.left)
+        else:
+            result.append(value)
+    return tuple(result)
+
+
+def _derivation_to_tree(derivation, tree_class):
+    outputs = []
+    tasks = [('enter', derivation)]
+    while tasks:
+        task = tasks.pop()
+        if task[0] == 'enter':
+            value = task[1]
+            if isinstance(value, TokenNode):
+                outputs.append(value.token)
+                continue
+
+            children = _logical_children(value)
+            tasks.append(('build', value, len(children)))
+            for child in reversed(children):
+                tasks.append(('enter', child))
+        else:
+            _, value, child_count = task
+            children = [outputs.pop() for _ in range(child_count)][::-1]
+            rule = value.rule
+            outputs.append(tree_class(rule.alias or rule.origin.name, children))
+    return outputs[0]
+
+
+_INVALID_RANK = object()
+_MISSING_RANK = object()
+
+
+class _FamilyEnumerator:
+    __slots__ = ('packed_node', 'family_index', 'base_cost', '__weakref__')
+
+    def __init__(self, packed_node, family_index, base_cost):
+        self.packed_node = packed_node
+        self.family_index = family_index
+        self.base_cost = base_cost
+
+
+class _SymbolDerivationStream:
+    __slots__ = ('symbol_node', 'results', 'families', '_unopened', '_pending_candidates',
+                 '_candidate_heap', '_initialized', '_exhausted', 'expanded_families',
+                 '__weakref__')
+
+    def __init__(self, symbol_node, cyclic_packed_nodes):
+        self.symbol_node = symbol_node
+        self.results = []
+        self.families = []
+        self._unopened = []
+        self._pending_candidates = []
+        self._candidate_heap = []
+        self._initialized = False
+        self._exhausted = False
+        self.expanded_families = 0
+
+        for family_index, packed_node in enumerate(symbol_node.children):
+            if id(packed_node) not in cyclic_packed_nodes:
+                self.families.append(_FamilyEnumerator(packed_node, len(self.families), 0))
+
+
+class TopKDerivations:
+    """Lazily enumerate the lowest-cost derivations of an Earley SPPF.
+
+    Derivations are ordered by total production cost. Ties are resolved by
+    packed-family order, then by the left-to-right ranks of the selected child
+    derivations. Each shared :class:`SymbolNode` keeps its own ranked result
+    list, so a shared subtree is enumerated once and then reused by reference.
+
+    Two derivations are distinct if they select different packed nodes at a
+    symbol occurrence. Repeated occurrences of the same shared derivation in
+    one production remain the same object in the DAG representation; their
+    positions distinguish them, and :meth:`Derivation.to_tree` copies each
+    occurrence.
+
+    Parameters:
+        root: A ``SymbolNode`` returned by ``Lark(..., ambiguity='forest')``.
+        k: Maximum number of root derivations to return.
+        rule_costs: A mapping from production ``Rule`` objects to non-negative
+            costs, or a callable receiving a rule and returning a cost. Missing
+            rules cost zero. Intermediate binary SPPF families do not add
+            another cost for the same production.
+        on_cycle: ``'error'`` raises :class:`ForestCycleError`; ``'skip'``
+            omits packed nodes that participate in an SPPF cycle and returns
+            the finite acyclic derivations.
+
+    The iterator is also a context manager. Closing it early drops buffered
+    candidate heaps; already returned derivations remain available.
+    """
+
+    def __init__(self, root, k=5, rule_costs=None, *, on_cycle='error'):
+        if not isinstance(root, SymbolNode):
+            raise TypeError('Expected a SymbolNode, got %r' % (root,))
+        if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
+            raise ValueError('k must be a positive integer')
+        if on_cycle not in ('error', 'skip'):
+            raise ValueError("on_cycle must be either 'error' or 'skip'")
+
+        self.root = root
+        self.k = k
+        self.on_cycle = on_cycle
+        self._rule_costs = rule_costs
+        self._streams = {}
+        self._stack = []
+        self._suspend_after_current = False
+        self._closed = False
+        self.expanded_symbol_nodes = 0
+        self.expanded_packed_nodes = 0
+
+        cyclic_packed_nodes = _find_cyclic_packed_nodes(root, self._rule_cost)
+        if cyclic_packed_nodes and on_cycle == 'error':
+            raise ForestCycleError(
+                'The parse forest contains a cycle and therefore has infinitely '
+                "many derivations. Pass on_cycle='skip' to enumerate finite, "
+                'acyclic derivations instead.')
+        self._cyclic_packed_nodes = cyclic_packed_nodes
+        self._root_stream = self._get_stream(root)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        rank = len(self._root_stream.results)
+        if rank >= self.k:
+            raise StopIteration
+        task = ('index', self._root_stream, rank)
+        if self._stack:
+            self._stack.insert(0, task)
+            self._process_stack()
+        else:
+            self._ensure_rank(self._root_stream, rank)
+        try:
+            return self._root_stream.results[rank]
+        except IndexError:
+            raise StopIteration
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+    def __del__(self):
+        if hasattr(self, '_streams'):
+            self.close()
+
+    def close(self):
+        """Release buffered candidate heaps used by this iterator."""
+        if self._closed:
+            return
+        self._closed = True
+        self._streams.clear()
+        self._stack.clear()
+        self._root_stream = None
+
+    @property
+    def expanded_nodes(self):
+        """Number of symbol and packed nodes expanded by the iterator."""
+        return self.expanded_symbol_nodes + self.expanded_packed_nodes
+
+    def _get_stream(self, symbol_node):
+        node_id = id(symbol_node)
+        stream = self._streams.get(node_id)
+        if stream is None:
+            stream = _SymbolDerivationStream(symbol_node, self._cyclic_packed_nodes)
+            self._streams[node_id] = stream
+        return stream
+
+    def _rule_cost(self, rule):
+        costs = self._rule_costs
+        if costs is None:
+            cost = 0
+        elif callable(costs):
+            cost = costs(rule)
+        else:
+            cost = costs.get(rule, 0)
+
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            raise TypeError('Production costs must be int or float numbers')
+        if cost < 0 or cost != cost:
+            raise ValueError('Production costs must be non-negative and finite')
+        return cost
+
+    def _initialize_stream(self, stream):
+        stream._initialized = True
+        self.expanded_symbol_nodes += 1
+        for family in stream.families:
+            packed_node = family.packed_node
+            family.base_cost = (
+                0 if packed_node.parent.is_intermediate
+                else self._rule_cost(packed_node.rule))
+        stream._unopened = sorted(
+            range(len(stream.families)),
+            key=lambda family_index: (
+                stream.families[family_index].base_cost, family_index),
+            reverse=True)
+
+    def _process_stack(self):
+        self._suspend_after_current = False
+        while self._stack:
+            task = self._stack.pop()
+            kind = task[0]
+            if kind == 'candidate':
+                self._prepare_candidate(*task[1:])
+            else:
+                self._produce_next(*task[1:])
+            if self._suspend_after_current:
+                break
+
+    def _ensure_rank(self, stream, target_rank):
+        self._stack.append(('index', stream, target_rank))
+        self._process_stack()
+
+    def _rank_value(self, forest_node, rank):
+        if forest_node is None:
+            return None if rank == 0 else _INVALID_RANK
+        if isinstance(forest_node, TokenNode):
+            return forest_node if rank == 0 else _INVALID_RANK
+
+        stream = self._get_stream(forest_node)
+        if rank < len(stream.results):
+            return stream.results[rank]
+        if stream._exhausted:
+            return _INVALID_RANK
+        return _MISSING_RANK
+
+    def _wait_for_rank(self, family, left_rank, right_rank, child, rank):
+        # The candidate stays below its dependency, so it is retried after
+        # the requested child rank has been produced.
+        self._stack.append(('candidate', family, left_rank, right_rank))
+        self._stack.append(('index', self._get_stream(child), rank))
+
+    def _child_rank_is_available(self, child, rank):
+        if child is None:
+            return rank == 0
+        if isinstance(child, TokenNode):
+            return rank == 0
+        stream = self._streams.get(id(child))
+        return stream is None or rank < len(stream.results) or not stream._exhausted
+
+    def _prepare_candidate(self, family, left_rank, right_rank):
+        packed_node = family.packed_node
+        if not self._child_rank_is_available(packed_node.left, left_rank):
+            return
+        if not self._child_rank_is_available(packed_node.right, right_rank):
+            return
+
+        left_value = self._rank_value(packed_node.left, left_rank)
+        if left_value is _MISSING_RANK:
+            self._wait_for_rank(family, left_rank, right_rank,
+                                packed_node.left, left_rank)
+            return
+        right_value = self._rank_value(packed_node.right, right_rank)
+        if right_value is _MISSING_RANK:
+            self._wait_for_rank(family, left_rank, right_rank,
+                                packed_node.right, right_rank)
+            return
+
+        left_cost = left_value.cost if isinstance(left_value, Derivation) else 0
+        right_cost = right_value.cost if isinstance(right_value, Derivation) else 0
+        total_cost = family.base_cost + left_cost + right_cost
+        stream = self._get_stream(packed_node.parent)
+        heappush(stream._candidate_heap, (
+            total_cost, family.family_index, left_rank, right_rank,
+            left_value, right_value))
+
+    def _open_family(self, stream, family_index):
+        stream.expanded_families += 1
+        self.expanded_packed_nodes += 1
+        family = stream.families[family_index]
+        self._stack.append(('candidate', family, 0, 0))
+
+    def _schedule_candidate(self, family, left_rank, right_rank):
+        self._stack.append(('candidate', family, left_rank, right_rank))
+
+    def _next_lower_bound_source(self, stream):
+        source = None
+        if stream._unopened:
+            family_index = stream._unopened[-1]
+            family = stream.families[family_index]
+            source = (family.base_cost, family_index, 'unopened', family_index)
+        if stream._pending_candidates:
+            lower_bound, _, sequence, family_index, _, _ = stream._pending_candidates[0]
+            pending_key = (lower_bound, 0, 'pending', sequence, family_index)
+            if source is None or pending_key < source:
+                source = pending_key
+        return source
+
+    def _produce_next(self, stream, target_rank):
+        if target_rank < len(stream.results):
+            return
+        if not stream._initialized:
+            self._initialize_stream(stream)
+
+        while True:
+            source = self._next_lower_bound_source(stream)
+            heap = stream._candidate_heap
+            if heap and (source is None or heap[0][:2] < source[:2]):
+                break
+
+            if source is None:
+                stream._exhausted = True
+                return
+
+            if source[2] == 'unopened':
+                family_index = stream._unopened.pop()
+                self._stack.append(('index', stream, target_rank))
+                self._open_family(stream, family_index)
+            else:
+                _, family_index, sequence, family, left_rank, right_rank = heappop(
+                    stream._pending_candidates)
+                self._stack.append(('index', stream, target_rank))
+                self._schedule_candidate(family, left_rank, right_rank)
+            return
+
+        total_cost, family_index, left_rank, right_rank, left_value, right_value = heappop(heap)
+        family = stream.families[family_index]
+        derivation = Derivation(
+            stream.symbol_node, family.packed_node, family.packed_node.rule,
+            total_cost, left_value, right_value)
+        stream.results.append(derivation)
+
+        # Each successor's total cost cannot fall below the selected total,
+        # because all production costs are non-negative. Keep these as lazy
+        # lower-bound candidates; child ranks are materialized only if selected.
+        heappush(stream._pending_candidates,
+                 (total_cost, family_index, 0, family, left_rank, right_rank + 1))
+        if right_rank == 0:
+            heappush(stream._pending_candidates,
+                     (total_cost, family_index, 1, family, left_rank + 1, 0))
+
+        if target_rank < len(stream.results):
+            if stream is self._root_stream:
+                self._suspend_after_current = True
+            return
+
+        self._stack.append(('index', stream, target_rank))
+
+
+def top_k_derivations(root, k=5, rule_costs=None, *, on_cycle='error'):
+    """Create a :class:`TopKDerivations` iterator."""
+    return TopKDerivations(root, k=k, rule_costs=rule_costs, on_cycle=on_cycle)
+
+
+def _find_cyclic_packed_nodes(root, rule_cost=None):
+    """Return ids of packed nodes belonging to any reachable SPPF cycle."""
+    nodes = {id(root): root}
+    reverse_adjacency = {id(root): []}
+    visit_stack = [(root, 0)]
+    finish_order = []
+
+    while visit_stack:
+        node, edge_index = visit_stack[-1]
+        if isinstance(node, TokenNode):
+            visit_stack.pop()
+            finish_order.append(id(node))
+            continue
+
+        children = node.children
+        if edge_index < len(children):
+            visit_stack[-1] = (node, edge_index + 1)
+            child = children[edge_index]
+            if (rule_cost is not None and isinstance(child, PackedNode)
+                    and not child.parent.is_intermediate):
+                rule_cost(child.rule)
+            if isinstance(child, TokenNode):
+                continue
+            child_id = id(child)
+            if child_id not in nodes:
+                nodes[child_id] = child
+                reverse_adjacency[child_id] = [id(node)]
+                visit_stack.append((child, 0))
+            else:
+                reverse_adjacency[child_id].append(id(node))
+        else:
+            visit_stack.pop()
+            finish_order.append(id(node))
+
+    cyclic_packed_nodes = set()
+    visited = set()
+    for node_id in reversed(finish_order):
+        if node_id in visited:
+            continue
+        component = []
+        stack = [node_id]
+        visited.add(node_id)
+        while stack:
+            current_id = stack.pop()
+            component.append(current_id)
+            for parent_id in reverse_adjacency[current_id]:
+                if parent_id not in visited:
+                    visited.add(parent_id)
+                    stack.append(parent_id)
+        if len(component) > 1:
+            for member_id in component:
+                member = nodes[member_id]
+                if isinstance(member, PackedNode):
+                    cyclic_packed_nodes.add(member_id)
+
+    return frozenset(cyclic_packed_nodes)

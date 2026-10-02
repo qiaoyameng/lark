@@ -12,6 +12,12 @@ from .lark import Lark
 from .lexer import Token
 from .parser_frontends import ScanMatch
 from .tree import ParseTree, Tree
+from .parsers.earley_forest import (
+    Derivation,
+    ForestCycleError,
+    TopKDerivations,
+    top_k_derivations,
+)
 from .utils import logger, TextSlice
 from .visitors import Discard, Transformer, Transformer_NonRecursive, Visitor, v_args
 
@@ -31,6 +37,10 @@ __all__ = (
     "ScanMatch",
     "ParseTree",
     "Tree",
+    "Derivation",
+    "ForestCycleError",
+    "TopKDerivations",
+    "top_k_derivations",
     "logger",
     "Discard",
     "Transformer",

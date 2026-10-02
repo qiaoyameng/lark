@@ -59,6 +59,31 @@ TreeForestTransformer
 .. autoclass:: lark.parsers.earley_forest.TreeForestTransformer
    :members: __default__, __default_token__, __default_ambig__
 
+TopKDerivations
+---------------
+
+When a forest represents many parse trees, ``top_k_derivations`` lazily
+enumerates the lowest-cost derivations instead of materializing the whole set.
+Costs are assigned to production rules with a mapping or callable. All costs
+must be non-negative.
+
+The returned derivations remain shared DAGs; shared subtrees are reused by
+reference. ``Derivation.to_tree()`` materializes one derivation as an ordinary
+parse tree and copies repeated occurrences. Ties use packed-family order and
+the left-to-right ranks of child derivations, so repeated enumeration is stable.
+
+Cyclic forests represent infinitely many derivations. By default a
+``ForestCycleError`` is raised; pass ``on_cycle='skip'`` to return only finite,
+acyclic derivations. Use ``close()`` or the iterator as a context manager to
+release buffered candidates when stopping early.
+
+.. autofunction:: lark.parsers.earley_forest.top_k_derivations
+.. autoclass:: lark.parsers.earley_forest.TopKDerivations
+   :members: close, expanded_nodes
+.. autoclass:: lark.parsers.earley_forest.Derivation
+   :members: cost, rule, children, to_tree
+.. autoclass:: lark.parsers.earley_forest.ForestCycleError
+
 handles_ambiguity
 -----------------
 
