@@ -11,6 +11,7 @@ from .test_cache import TestCache
 from .test_grammar import TestGrammar
 from .test_reconstructor import TestReconstructor
 from .test_tree_forest_transformer import TestTreeForestTransformer
+from .test_forest_top_k import TestForestTopK
 from .test_lexer import TestLexer
 from .test_python_grammar import TestPythonParser
 from .test_scan import TestScan

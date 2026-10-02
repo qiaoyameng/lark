@@ -7,6 +7,8 @@ Full reference and more details is here:
 https://web.archive.org/web/20190616123959/http://www.bramvandersanden.com/post/2014/06/shared-packed-parse-forest/
 """
 
+import heapq
+import math
 from typing import Type, AbstractSet
 from random import randint
 from collections import deque
@@ -14,6 +16,8 @@ from operator import attrgetter
 from importlib import import_module
 from functools import partial
 
+from ..exceptions import LarkError
+from ..grammar import Rule
 from ..parse_tree_builder import AmbiguousIntermediateExpander
 from ..visitors import Discard
 from ..utils import logger, OrderedSet
@@ -476,6 +480,474 @@ class ForestSumVisitor(ForestVisitor):
 
     def visit_symbol_node_out(self, node):
         node.priority = max(child.priority for child in node.children)
+
+class ForestCycleError(LarkError):
+    """Raised when a parse forest contains a cycle (i.e. infinite ambiguity)
+    and the requested operation cannot produce a finite, controlled result."""
+
+def _node_tiebreak_key(node):
+    """A deterministic, content-based key used to order forest nodes.
+
+    Unlike identity-based ordering, this key is stable across runs, which
+    keeps the tie-breaking of ``ForestTopKIterator`` reproducible.
+    """
+    if node is None:
+        return (0, -1, -1, '')
+    if isinstance(node, TokenNode):
+        token = node.token
+        start = token.start_pos if token.start_pos is not None else -1
+        end = token.end_pos if token.end_pos is not None else -1
+        return (2, start, end, str(token))
+    return (1, node.start, node.end, str(node.s))
+
+def _packed_tiebreak_key(packed):
+    return (packed.sort_key, _node_tiebreak_key(packed.left), _node_tiebreak_key(packed.right))
+
+def _collect_symbol_graph(root):
+    """Iteratively collects all symbol nodes reachable from ``root``.
+
+    Returns ``(symbols, packed_map)`` where ``packed_map`` maps ``id(symbol)``
+    to a list of ``(packed_node, [symbol children])`` entries.
+    """
+    symbols = []
+    packed_map = {}
+    seen = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        symbols.append(node)
+        entries = []
+        for packed in node.children:
+            child_symbols = []
+            for child in (packed.left, packed.right):
+                if isinstance(child, SymbolNode):
+                    child_symbols.append(child)
+                    stack.append(child)
+            entries.append((packed, child_symbols))
+        packed_map[id(node)] = entries
+    return symbols, packed_map
+
+def _analyze_cycles(root):
+    """Detects cycles (infinite ambiguity) in the forest rooted at ``root``.
+
+    Computes the strongly connected components of the symbol-node graph
+    (using an iterative Tarjan traversal, so deep forests are safe).
+
+    Returns ``(example, blocked)`` where ``example`` is a ``SymbolNode``
+    participating in a cycle (or ``None`` if the forest is acyclic), and
+    ``blocked`` is a set of ``id()`` of packed nodes whose use could
+    close a cycle: packed nodes of a *non-intermediate* symbol node with a
+    child in the same cyclic component. (Packed nodes of intermediate nodes
+    are kept, because they also serve legitimate acyclic derivations.)
+    Every cycle in the forest passes through at least one blocked packed
+    node, so removing them makes the forest a DAG; only cycle-free
+    derivations remain.
+    """
+    symbols, packed_map = _collect_symbol_graph(root)
+    adjacency = {}
+    for node in symbols:
+        adjacency[id(node)] = [child for _packed, children in packed_map[id(node)] for child in children]
+
+    index_of = {}
+    lowlink = {}
+    on_stack = set()
+    stack = []
+    sccs = []
+    counter = 0
+    for start in symbols:
+        if id(start) in index_of:
+            continue
+        index_of[id(start)] = lowlink[id(start)] = counter
+        counter += 1
+        stack.append(start)
+        on_stack.add(id(start))
+        work = [(start, iter(adjacency[id(start)]))]
+        while work:
+            node, children_it = work[-1]
+            descended = False
+            for succ in children_it:
+                succ_id = id(succ)
+                if succ_id not in index_of:
+                    index_of[succ_id] = lowlink[succ_id] = counter
+                    counter += 1
+                    stack.append(succ)
+                    on_stack.add(succ_id)
+                    work.append((succ, iter(adjacency[succ_id])))
+                    descended = True
+                    break
+                elif succ_id in on_stack and index_of[succ_id] < lowlink[id(node)]:
+                    lowlink[id(node)] = index_of[succ_id]
+            if descended:
+                continue
+            work.pop()
+            node_id = id(node)
+            if work and lowlink[node_id] < lowlink[id(work[-1][0])]:
+                lowlink[id(work[-1][0])] = lowlink[node_id]
+            if lowlink[node_id] == index_of[node_id]:
+                scc = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(id(member))
+                    scc.append(member)
+                    if member is node:
+                        break
+                sccs.append(scc)
+
+    cyclic_scc = {}
+    example = None
+    for scc_index, scc in enumerate(sccs):
+        if len(scc) > 1:
+            cyclic = True
+        else:
+            node = scc[0]
+            cyclic = any(child is node for child in adjacency[id(node)])
+        if cyclic:
+            if example is None:
+                example = scc[0]
+            for node in scc:
+                cyclic_scc[id(node)] = scc_index
+
+    blocked = set()
+    if cyclic_scc:
+        for node in symbols:
+            if node.is_intermediate:
+                continue
+            scc_index = cyclic_scc.get(id(node))
+            if scc_index is None:
+                continue
+            for packed, children in packed_map[id(node)]:
+                if any(cyclic_scc.get(id(child)) == scc_index for child in children):
+                    blocked.add(id(packed))
+    return example, blocked
+
+def _validate_cost(value, rule):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("Cost for rule %r must be an int or float, got %r" % (rule, value))
+    if math.isnan(value):
+        raise ValueError("Cost for rule %r must not be NaN" % (rule,))
+    if value < 0:
+        raise ValueError("Cost for rule %r must be non-negative, got %r" % (rule, value))
+    return value
+
+class _Derivation:
+    """A single enumerated derivation of a symbol node: which packed node
+    was chosen, and which ranked sub-derivations of its children."""
+    __slots__ = ('cost', 'packed', 'left_rank', 'right_rank')
+
+    def __init__(self, cost, packed, left_rank, right_rank):
+        self.cost = cost
+        self.packed = packed
+        self.left_rank = left_rank
+        self.right_rank = right_rank
+
+class _SymbolNodeExpander:
+    """Lazily enumerates the derivations of a single symbol node, cheapest
+    first, using a best-first heap over (packed node, left rank, right rank)
+    candidates. Shared symbol nodes get exactly one expander, so shared
+    subtrees are never re-expanded.
+    """
+    __slots__ = ('node', 'derivations', 'heap', 'pending', 'seen', 'exhausted')
+
+    def __init__(self, node, packed_nodes):
+        self.node = node
+        self.derivations = []
+        self.heap = []
+        self.pending = deque()
+        self.seen = set()
+        self.exhausted = False
+        for packed in packed_nodes:
+            key = (id(packed), 0, 0)
+            self.seen.add(key)
+            self.pending.append((packed, 0, 0))
+
+    def release(self):
+        self.derivations = []
+        self.heap = []
+        self.pending = deque()
+        self.seen = set()
+
+class ForestTopKIterator:
+    """Iterates over the derivations of an Earley parse forest (SPPF),
+    cheapest first, so that callers can take the top-k derivations without
+    materializing the whole (possibly exponential) ambiguity forest.
+
+    The caller assigns a non-negative cost to each production; the cost of a
+    derivation is the sum of the costs of the productions it applies.
+    Derivations are yielded as ``(cost, tree)`` pairs in non-decreasing
+    order of total cost.
+
+    Sharing:
+        Each symbol node of the forest is expanded lazily and at most once;
+        its ranked derivations are memoized and reused by every parent, so
+        shared subtrees are never fully re-expanded. The number of
+        derivations and candidate expansions materialized so far is exposed
+        via the ``nodes_expanded`` and ``candidates_generated`` attributes.
+
+    Tie-breaking (stability):
+        Ties are broken deterministically. At each symbol node, alternative
+        derivations (packed nodes) are considered in the forest's canonical
+        order: empty derivations first, then by descending priority, then by
+        grammar rule order, then by span and symbol name. Combinations of
+        sub-derivations are explored in lexicographic order of their ranks.
+        Iterating the same forest twice with the same costs always yields
+        the same sequence.
+
+    Duplicates:
+        A derivation is identified by its sequence of choices (which packed
+        node is used at each symbol node), not by the tree it produces.
+        Distinct derivations that build equal trees are all yielded.
+
+    Cycles:
+        If the forest contains a cycle (the grammar is infinitely ambiguous
+        for the input), the default ``on_cycle='error'`` raises
+        ``ForestCycleError`` when the iterator is created. With
+        ``on_cycle='skip'``, packed nodes that could close a cycle (a
+        production whose left-hand side can derive itself through one of
+        the production's children) are excluded up front, reducing the
+        forest to a DAG. Iteration then always terminates and yields only
+        cycle-free derivations; note that this may also exclude a few
+        technically acyclic derivations that share a cyclic component.
+
+    Early termination:
+        Callers that stop before exhaustion should call ``close()`` (or use
+        the iterator as a context manager) to release the temporary
+        candidate heaps and memoized derivations. Exhausting the iterator
+        closes it automatically.
+
+    Parameters:
+        root: The root ``SymbolNode`` of a parse forest, as returned by
+            parsing with ``ambiguity='forest'``.
+        rule_costs: Optional. Either a callable ``rule -> non-negative
+            number``, or a mapping keyed by ``Rule`` objects or rule names
+            (strings, matched against the rule's alias or origin name).
+            Productions without an explicit cost default to 0.
+        on_cycle: ``'error'`` (default) or ``'skip'``.
+        tree_class: The class used to build the resulting trees.
+
+    Example:
+        >>> from lark import Lark
+        >>> from lark.parsers.earley_forest import ForestTopKIterator
+        >>> parser = Lark('start: "a" "a"', parser='earley', ambiguity='forest')
+        >>> forest = parser.parse('aa')
+        >>> with ForestTopKIterator(forest) as top_k:
+        ...     for cost, tree in top_k:
+        ...         print(cost, tree.pretty())
+    """
+
+    def __init__(self, root, rule_costs=None, on_cycle='error', tree_class=Tree):
+        self._closed = True
+        self._expanders = {}
+        if not isinstance(root, SymbolNode):
+            raise TypeError("ForestTopKIterator expects the root SymbolNode of a parse forest, got %r" % (root,))
+        if on_cycle not in ('error', 'skip'):
+            raise ValueError("on_cycle must be 'error' or 'skip', got %r" % (on_cycle,))
+        self._root = root
+        self._tree_class = tree_class
+        self._rule_cost = self._compile_costs(rule_costs)
+        self._seq = 0
+        self._yielded = 0
+        self.nodes_expanded = 0
+        self.candidates_generated = 0
+        example, self._blocked = _analyze_cycles(root)
+        if example is not None and on_cycle == 'error':
+            raise ForestCycleError(
+                "The parse forest contains a cycle (infinite ambiguity) involving node %s. "
+                "Top-k iteration over an infinite number of derivations is not supported; "
+                "pass on_cycle='skip' to enumerate only the cycle-free derivations." % (example,))
+        self._closed = False
+
+    @staticmethod
+    def _compile_costs(rule_costs):
+        if rule_costs is None:
+            return lambda rule: 0
+        if callable(rule_costs):
+            def call_cost(rule):
+                return _validate_cost(rule_costs(rule), rule)
+            return call_cost
+        if not hasattr(rule_costs, 'items'):
+            raise TypeError("rule_costs must be a callable or a mapping, got %r" % (rule_costs,))
+        by_rule = {}
+        by_name = {}
+        for key, value in rule_costs.items():
+            value = _validate_cost(value, key)
+            if isinstance(key, Rule):
+                by_rule[key] = value
+            elif isinstance(key, str):
+                by_name[key] = value
+            else:
+                raise TypeError("rule_costs keys must be Rule instances or rule names (strings), got %r" % (key,))
+        def lookup_cost(rule):
+            if rule in by_rule:
+                return by_rule[rule]
+            name = rule.alias if rule.alias is not None else rule.origin.name
+            if name in by_name:
+                return by_name[name]
+            return by_name.get(rule.origin.name, 0)
+        return lookup_cost
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        expander = self._expander_for(self._root)
+        if not self._ensure(expander, self._yielded):
+            self.close()
+            raise StopIteration
+        derivation = expander.derivations[self._yielded]
+        self._yielded += 1
+        return derivation.cost, self._build_tree(self._root, derivation)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self):
+        """Releases all temporary candidates and memoized derivations.
+
+        Safe to call multiple times; iteration cannot continue afterwards.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        for expander in self._expanders.values():
+            expander.release()
+        self._expanders.clear()
+
+    def _expander_for(self, node):
+        expander = self._expanders.get(id(node))
+        if expander is None:
+            packed_nodes = [p for p in node.children if id(p) not in self._blocked]
+            packed_nodes.sort(key=_packed_tiebreak_key)
+            expander = _SymbolNodeExpander(node, packed_nodes)
+            self._expanders[id(node)] = expander
+        return expander
+
+    def _enqueue_candidate(self, expander, packed, left_rank, right_rank):
+        if left_rank > 0 and packed.left is None:
+            return
+        if right_rank > 0 and not isinstance(packed.right, SymbolNode):
+            return
+        key = (id(packed), left_rank, right_rank)
+        if key in expander.seen:
+            return
+        expander.seen.add(key)
+        expander.pending.append((packed, left_rank, right_rank))
+
+    def _candidate_cost(self, expander, packed, left_rank, right_rank):
+        """Returns ``(cost, blocker)``: the candidate's total cost, or
+        ``(None, (expander, rank))`` naming a child sub-derivation that must
+        be enumerated first. ``(None, None)`` means the candidate is invalid
+        (a child ran out of derivations)."""
+        cost = 0
+        if not expander.node.is_intermediate:
+            cost += self._rule_cost(packed.rule)
+        if packed.left is not None:
+            left_expander = self._expander_for(packed.left)
+            if left_rank >= len(left_expander.derivations):
+                if left_expander.exhausted:
+                    return None, None
+                return None, (left_expander, left_rank)
+            cost += left_expander.derivations[left_rank].cost
+        if isinstance(packed.right, SymbolNode):
+            right_expander = self._expander_for(packed.right)
+            if right_rank >= len(right_expander.derivations):
+                if right_expander.exhausted:
+                    return None, None
+                return None, (right_expander, right_rank)
+            cost += right_expander.derivations[right_rank].cost
+        return cost, None
+
+    def _ensure(self, expander, rank):
+        """Makes sure ``expander.derivations[rank]`` exists (returns True),
+        or that the expander is exhausted (returns False).
+
+        Uses an explicit work stack instead of recursion, so arbitrarily
+        deep forests cannot overflow the Python call stack. The forest is
+        guaranteed cycle-free at this point (cycles raise or are skipped in
+        ``__init__``), so the work stack always drains.
+        """
+        stack = [(expander, rank)]
+        while stack:
+            current, needed = stack[-1]
+            if needed < len(current.derivations) or current.exhausted:
+                stack.pop()
+                continue
+            if current.pending:
+                packed, left_rank, right_rank = current.pending[0]
+                cost, blocker = self._candidate_cost(current, packed, left_rank, right_rank)
+                if blocker is not None:
+                    stack.append(blocker)
+                    continue
+                current.pending.popleft()
+                if cost is not None:
+                    self._seq += 1
+                    heapq.heappush(current.heap, (cost, self._seq, packed, left_rank, right_rank))
+                    self.candidates_generated += 1
+                continue
+            if current.heap:
+                cost, _seq, packed, left_rank, right_rank = heapq.heappop(current.heap)
+                current.derivations.append(_Derivation(cost, packed, left_rank, right_rank))
+                self.nodes_expanded += 1
+                self._enqueue_candidate(current, packed, left_rank + 1, right_rank)
+                self._enqueue_candidate(current, packed, left_rank, right_rank + 1)
+                continue
+            current.exhausted = True
+        return rank < len(expander.derivations)
+
+    def _build_tree(self, node, derivation):
+        """Materializes a derivation as a tree, iteratively (deep
+        derivations of flat trees must not overflow the call stack).
+        Intermediate nodes splice their children into the parent, mirroring
+        ``ForestToParseTree``."""
+        def make_frame(frame_node, frame_derivation):
+            packed = frame_derivation.packed
+            todo = []
+            if packed.left is not None:
+                todo.append((packed.left, frame_derivation.left_rank))
+            if packed.right is not None:
+                todo.append((packed.right, frame_derivation.right_rank))
+            return [frame_node, packed, [], todo, 0]
+
+        stack = [make_frame(node, derivation)]
+        while stack:
+            frame = stack[-1]
+            frame_node, frame_packed, items, todo, index = frame
+            if index < len(todo):
+                frame[4] += 1
+                child, child_rank = todo[index]
+                if isinstance(child, TokenNode):
+                    items.append(child.token)
+                else:
+                    child_derivation = self._expanders[id(child)].derivations[child_rank]
+                    stack.append(make_frame(child, child_derivation))
+                continue
+            stack.pop()
+            if frame_node.is_intermediate:
+                result = items
+            else:
+                rule = frame_packed.rule
+                result = self._tree_class(rule.alias or rule.origin.name, items)
+            if not stack:
+                return result
+            parent_items = stack[-1][2]
+            if frame_node.is_intermediate:
+                parent_items.extend(result)
+            else:
+                parent_items.append(result)
+
 
 class PackedData():
     """Used in transformationss of packed nodes to distinguish the data
